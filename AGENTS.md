@@ -61,7 +61,13 @@ test database. Pricing and validation tests should not require database access.
 
 ## Configuration
 
-Create a local `.env` file with:
+Create a local `.env` file from the checked-in template:
+
+```bash
+cp .env.example .env
+```
+
+Then adjust these values if needed:
 
 - `DATABASE_URL`: application PostgreSQL connection string.
 - `TEST_DATABASE_URL`: disposable PostgreSQL connection string used by tests.

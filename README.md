@@ -5,6 +5,17 @@ and listing agreements. Python 3.13, FastAPI, SQLAlchemy 2, and PostgreSQL 16.
 
 ## Run locally
 
+Create the environment file from the checked-in example:
+
+```bash
+cp .env.example .env
+```
+
+Adjust the values in `.env` if your PostgreSQL configuration differs. `.env` is
+ignored by Git and should contain only local configuration.
+
+Then run the application:
+
 ```bash
 ./run.sh
 ```
