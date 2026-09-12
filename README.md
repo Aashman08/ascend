@@ -43,7 +43,11 @@ the API with:
 uv run uvicorn app.server:app --reload
 ```
 
-Startup creates missing tables; it does not upgrade existing schemas.
+### Database migrations
+
+`./run.sh` applies pending numbered SQL migrations automatically. For future schema
+changes, add the next migration file, commit it with the model change, and restart
+the API. Existing migration files should not be edited.
 
 ## APIs
 
@@ -187,6 +191,51 @@ Authentication and user modeling remain out of scope. Request IDs correlate call
 they are not verified actor identities. A future authenticated integration should
 record the principal from trusted authentication context.
 
+## Data model
+
+This project uses SQLAlchemy models backed by PostgreSQL; it does not use Prisma.
+
+### `finance_terms`
+
+| Field | PostgreSQL type | Notes |
+|---|---|---|
+| `id` | `UUID` | Primary key. |
+| `status` | `terms_status` enum | `pending` or `agreed`. |
+| `due_date` | `DATE` | Terms expiry date. |
+| `total_downpayment` | `NUMERIC(12,2)` | Total amount due upfront. |
+| `agreed_at` | `TIMESTAMPTZ` | Nullable until terms are agreed. |
+| `created_at` | `TIMESTAMPTZ` | Database-generated creation time. |
+| `updated_at` | `TIMESTAMPTZ` | Database-generated update time. |
+
+### `policies`
+
+| Field | PostgreSQL type | Notes |
+|---|---|---|
+| `id` | `UUID` | Primary key. |
+| `finance_terms_id` | `UUID` | Foreign key to `finance_terms.id`; cascades on delete. |
+| `insured_name` | `VARCHAR(200)` | Required customer name. |
+| `name` | `VARCHAR(200)` | Required policy label. |
+| `premium` | `NUMERIC(12,2)` | Policy premium. |
+| `tax_fee` | `NUMERIC(12,2)` | Tax or fee amount. |
+| `downpayment` | `NUMERIC(12,2)` | Calculated upfront amount. |
+| `created_at` | `TIMESTAMPTZ` | Database-generated creation time. |
+
+### `audit_events`
+
+| Field | PostgreSQL type | Notes |
+|---|---|---|
+| `id` | `BIGINT` identity | Primary key. |
+| `finance_terms_id` | `UUID` | No foreign key; missing IDs can be audited. |
+| `action` | `VARCHAR(20)` | `create` or `agree`. |
+| `outcome` | `VARCHAR(20)` | `succeeded`, `unchanged`, or `rejected`. |
+| `occurred_at` | `TIMESTAMPTZ` | Database-generated event time. |
+| `request_id` | `VARCHAR(200)` | Server-generated request ID. |
+| `details` | `JSONB` | Action-specific audit payload. |
+
+`finance_terms` has many `policies`. Deleting a finance-terms record cascades to
+its policies. Audit events are independent and remain available after a parent
+record is deleted.
+
 ## Data and code organization
 
 | Module | Responsibility |
@@ -202,7 +251,8 @@ record the principal from trusted authentication context.
 | `app/middleware.py` | Server-generated request-ID middleware. |
 | `app/exception_handlers.py` | Converts application exceptions into HTTP error responses. |
 | `app/server.py` | FastAPI application declaration and component registration. |
-| `app/database.py` | Settings, database engine/session configuration, and startup table creation. |
+| `app/database.py` | Settings, database engine/session configuration, and startup migrations. |
+| `migrations/` | Numbered SQL files defining schema changes. |
 
 Indexes support downpayment and due-date queries, policy lookup by parent, and audit
 history by terms ID/event ID. Status has no standalone index. Policy names are
@@ -267,17 +317,40 @@ uv run pytest tests/test_pricing.py tests/test_validation.py tests/test_errors.p
 
 The second command needs no running database. Integration tests use
 `TEST_DATABASE_URL`, creating and dropping isolated schemas inside that database.
+Each schema is initialized through the same migrations used at application startup.
 They exercise acceptance concurrency, retries/rejections, monetary validation,
-audit recording, and transaction rollback.
+audit recording, and transaction rollback. Migration tests also verify schema/model
+agreement, data preservation on restart, upgrades to populated databases, rollback
+on failure, and concurrent startup.
 
 Creation itself has no idempotency key: retrying creation can create another
 agreement. Authentication and tenancy are outside this exercise. Audit history and its tests extend the original take-home scope.
 
 ## Things to Add On
 
-**Cancellation and replacement terms:** A future cancellation operation could mark
-pending terms as cancelled, prevent acceptance, and record the action and reason
-in the audit trail. Revised terms would be created as a new agreement, optionally
-linked to the cancelled one, preserving the original terms and policies. Handling
-already agreed terms would require a separate business decision. Cancellation is
-not implemented because it falls outside the assessment's three user stories.
+These extensions are outside the implemented assessment scope, listed in suggested
+implementation order:
+
+1. **Idempotent creation:** Accept an `Idempotency-Key` so retries after a lost
+   response return the original agreement without duplicating terms or policies.
+   Reusing a key with different inputs would return a conflict.
+
+2. **Authentication and ownership:** Restrict access to terms and audit history by
+   agency or customer, and record the authenticated actor in business events.
+   Request IDs would continue to identify individual calls, independently of actor
+   identity.
+
+3. **Cancellation and replacement terms:** Allow pending terms to be cancelled,
+   prevent subsequent acceptance, and audit the action and reason. Revised terms
+   would form a new agreement linked to the original, preserving its policies and
+   history; cancellation of already agreed terms needs separate business rules.
+
+4. **Payment tracking:** Integrate a payment provider to track downpayment
+   collection, failed payments, and refunds. Payment status would be tracked
+   separately from agreement status because accepting terms does not mean payment
+   has been collected.
+
+5. **Event notifications:** Notify integrating applications when terms are
+   accepted, cancelled, or approaching expiry so they need not repeatedly fetch
+   records. Webhook delivery would support retries and event IDs for consumers to
+   detect duplicate deliveries.

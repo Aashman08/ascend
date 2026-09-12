@@ -9,8 +9,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app import client as client_module
-from app.database import settings
-from app.models import Base
+from app.database import migrate_database, settings
 from app.server import app
 
 
@@ -36,7 +35,7 @@ def database_engine():
 @pytest.fixture
 def session_factory(database_engine):
     """Create the application tables and return a session factory for the schema."""
-    Base.metadata.create_all(database_engine)
+    migrate_database(database_engine)
     return sessionmaker(bind=database_engine, expire_on_commit=False)
 
 
