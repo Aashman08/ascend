@@ -1,0 +1,137 @@
+"""Request validation and public response contracts. Money serializes as strings."""
+
+import enum
+import uuid
+from datetime import UTC, date, datetime
+from decimal import Decimal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+from app import pricing
+from app.models import TermsStatus
+
+class PolicyCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    insured_name: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=200, examples=["Commercial Auto 2026"])
+    premium: Decimal = Field(gt=0, le=pricing.MAX_AMOUNT, decimal_places=2)
+    tax_fee: Decimal = Field(ge=0, le=pricing.MAX_AMOUNT, decimal_places=2)
+
+    @model_validator(mode="after")
+    def downpayment_fits_storage(self) -> "PolicyCreate":
+        pricing.validate_policy_downpayment(self.premium, self.tax_fee)
+        return self
+
+
+class FinanceTermsCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    due_date: date = Field(
+        description="Last day terms are honored, inclusive; today or later (UTC)."
+    )
+    policies: list[PolicyCreate] = Field(min_length=1, max_length=100)
+
+    @field_validator("due_date")
+    @classmethod
+    def due_date_not_past(cls, value: date) -> date:
+        if value < datetime.now(UTC).date():
+            raise ValueError("due_date must be today or later (UTC)")
+        return value
+
+    @model_validator(mode="after")
+    def total_downpayment_fits_storage(self) -> "FinanceTermsCreate":
+        pricing.validate_total_downpayment((p.premium, p.tax_fee) for p in self.policies)
+        return self
+
+
+class SortField(str, enum.Enum):
+    downpayment = "downpayment"
+    due_date = "due_date"
+
+
+class SortOrder(str, enum.Enum):
+    asc = "asc"
+    desc = "desc"
+
+
+class FinanceTermsFilters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    downpayment_gt: Decimal | None = Field(None, ge=0, le=pricing.MAX_AMOUNT, decimal_places=2)
+    downpayment_lt: Decimal | None = Field(None, ge=0, le=pricing.MAX_AMOUNT, decimal_places=2)
+    downpayment_eq: Decimal | None = Field(None, ge=0, le=pricing.MAX_AMOUNT, decimal_places=2)
+    status: TermsStatus | None = None
+    sort: SortField = SortField.due_date
+    order: SortOrder = SortOrder.asc
+    limit: int = Field(20, ge=1, le=100)
+    offset: int = Field(0, ge=0)
+
+    @model_validator(mode="after")
+    def filters_are_consistent(self) -> "FinanceTermsFilters":
+        if self.downpayment_eq is not None and (
+            self.downpayment_gt is not None or self.downpayment_lt is not None
+        ):
+            raise ValueError("downpayment_eq cannot combine with downpayment_gt or downpayment_lt")
+        if (
+            self.downpayment_gt is not None
+            and self.downpayment_lt is not None
+            and self.downpayment_gt >= self.downpayment_lt
+        ):
+            raise ValueError("downpayment_gt must be less than downpayment_lt")
+        return self
+
+
+class PolicyResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    insured_name: str
+    name: str
+    premium: Decimal
+    tax_fee: Decimal
+    downpayment: Decimal
+    created_at: datetime
+
+
+class FinanceTermsResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    status: TermsStatus
+    due_date: date
+    total_downpayment: Decimal
+    total_amount: Decimal
+    amount_financed: Decimal
+    agreed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    policies: list[PolicyResponse]
+
+
+class FinanceTermsListResponse(BaseModel):
+    data: list[FinanceTermsResponse]
+    has_more: bool
+
+
+class AuditEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    finance_terms_id: uuid.UUID
+    action: str
+    outcome: str
+    occurred_at: datetime
+    request_id: str | None
+    details: dict
+
+
+class AuditListResponse(BaseModel):
+    data: list[AuditEventResponse]
+    has_more: bool
