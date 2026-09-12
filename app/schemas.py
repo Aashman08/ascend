@@ -1,6 +1,7 @@
 """Request validation and public response contracts. Money serializes as strings."""
 
 import enum
+import re
 import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -34,9 +35,16 @@ class FinanceTermsCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     due_date: date = Field(
-        description="Last day terms are honored, inclusive; today or later (UTC)."
+        description="Last day terms are honored, inclusive; YYYY-MM-DD, today or later (UTC)."
     )
     policies: list[PolicyCreate] = Field(min_length=1, max_length=100)
+
+    @field_validator("due_date", mode="before")
+    @classmethod
+    def due_date_format(cls, value: object) -> object:
+        if isinstance(value, str) and not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+            raise ValueError("due_date must use YYYY-MM-DD, for example 2026-05-12")
+        return value
 
     @field_validator("due_date")
     @classmethod

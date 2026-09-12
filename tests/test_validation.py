@@ -11,6 +11,43 @@ from app.schemas import FinanceTermsCreate, PolicyCreate
 from app.server import app
 
 
+@pytest.mark.parametrize(
+    "due_date,message",
+    [
+        ("2026-5-12", "due_date must use YYYY-MM-DD"),
+        ("2026-05-2", "due_date must use YYYY-MM-DD"),
+        ("2000-05-12", "due_date must be today or later (UTC)"),
+    ],
+)
+def test_due_date_format_and_past_date_have_distinct_errors(due_date, message):
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/finance-terms",
+            json={
+                "due_date": due_date,
+                "policies": [
+                    {"name": "Auto", "insured_name": "Business", "premium": "100", "tax_fee": "0"}
+                ],
+            },
+        )
+        assert response.status_code == 422
+        error = response.json()["detail"][0]
+        assert error["loc"] == ["body", "due_date"]
+        assert message in error["msg"]
+    finally:
+        client.close()
+
+
+def test_due_date_accepts_today_in_iso_format():
+    today = datetime.now(UTC).date()
+    terms = FinanceTermsCreate(
+        due_date=today.isoformat(),
+        policies=[{"name": "Auto", "insured_name": "Business", "premium": "100", "tax_fee": "0"}],
+    )
+    assert terms.due_date == today
+
+
 @pytest.mark.parametrize("name", [None, "", "   "])
 def test_policy_name_must_be_nonblank(name):
     """Policy names reject null, empty, and whitespace-only values."""
