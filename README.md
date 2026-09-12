@@ -64,7 +64,8 @@ has `total_downpayment="200.00"`, `total_amount="600.00"`, and
 
 Both policy `name` and `insured_name` are required, trimmed, and 1–200 characters.
 Premium must be positive; tax fee may be zero. Amounts accept at most two decimal
-places. There must be 1–100 policies and the due date must be today or later.
+places. There must be 1–100 policies and the due date must use `YYYY-MM-DD`
+with a zero-padded month/day and be today or later.
 Unknown fields, overflowing policy downpayments, and overflowing aggregate
 downpayments are rejected with HTTP 422 before any rows are written.
 
@@ -78,11 +79,14 @@ Returns HTTP 200 with `status="agreed"` and the acceptance
 time in both `agreed_at` and `updated_at`. Acceptance locks the row so concurrent
 calls make exactly one transition. Retries return HTTP 200 with the original
 acceptance time, including retries after the due date has passed. Unaccepted
-terms past their due date return HTTP 409 `terms_expired`.
+terms past their due date return HTTP 409 with an `invalid_state` error explaining
+that the terms have expired.
 
 Doing nothing leaves a pending record unchanged. Declining, editing, and canceling
 terms are not supported. Business actions and their outcomes are recorded in the
 audit history. Retries and rejections do not change the terms or their timestamps.
+Each acceptance request gets its own audit event: the first acceptance records
+`agree / succeeded`, and subsequent requests record `agree / unchanged`.
 
 ### List, filter, and sort
 
@@ -107,11 +111,17 @@ and contradictory filters return HTTP 422.
 ## Business audit trail
 
 ```bash
-curl -s 'localhost:8000/finance-terms/<id>/audit?limit=20&offset=0'
+# All audit events
+curl -s 'localhost:8000/audit?limit=20&offset=0'
+
+# Only events for one finance-terms agreement
+curl -s 'localhost:8000/audit?finance_terms_id=<id>&limit=20&offset=0'
 ```
 
 Returns the same `data`/`has_more` envelope, with events ordered by increasing ID.
-Each event contains the terms ID, action, outcome, database timestamp, request ID,
+Omit `finance_terms_id` to list events across all agreements; supply a UUID to filter.
+`limit` defaults to 20 (maximum 100) and `offset` defaults to 0. Each event contains
+the terms ID, action, outcome, database timestamp, request ID,
 and JSON details. The history endpoint also works for missing terms IDs, allowing
 inspection of rejected attempts; an ID with no history returns an empty list.
 

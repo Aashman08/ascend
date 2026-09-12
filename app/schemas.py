@@ -42,6 +42,8 @@ class FinanceTermsCreate(BaseModel):
     @field_validator("due_date", mode="before")
     @classmethod
     def due_date_format(cls, value: object) -> object:
+        if isinstance(value, (int, float, Decimal)):
+            raise ValueError("due_date must be a YYYY-MM-DD string")
         if isinstance(value, str) and not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
             raise ValueError("due_date must use YYYY-MM-DD, for example 2026-05-12")
         return value
@@ -126,6 +128,16 @@ class FinanceTermsResponse(BaseModel):
 class FinanceTermsListResponse(BaseModel):
     data: list[FinanceTermsResponse]
     has_more: bool
+
+
+class ErrorBody(BaseModel):
+    type: str
+    message: str
+    request_id: str
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorBody
 
 
 class AuditEventResponse(BaseModel):

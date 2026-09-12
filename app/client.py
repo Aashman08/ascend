@@ -13,7 +13,6 @@ from app.database import SessionLocal
 from app.errors import FinanceTermsNotFoundError, TermsExpiredError
 from app.models import AuditEvent, FinanceTerms, Policy, TermsStatus
 from app.pricing import compute_totals, policy_downpayment
-from app.serializers import finance_terms_response
 from app.schemas import (
     AuditListResponse,
     FinanceTermsCreate,
@@ -23,6 +22,7 @@ from app.schemas import (
     SortField,
     SortOrder,
 )
+from app.serializers import finance_terms_response
 
 
 class FinanceTermsClient:
@@ -72,7 +72,11 @@ class FinanceTermsClient:
         )
         if terms is None:
             record_agree_event(
-                self.db, terms_id, self.request_id, "rejected", {"reason": "finance_terms_not_found"}
+                self.db,
+                terms_id,
+                self.request_id,
+                "rejected",
+                {"reason": "finance_terms_not_found"},
             )
             self.db.commit()
             raise FinanceTermsNotFoundError(terms_id)
@@ -143,16 +147,13 @@ class FinanceTermsClient:
             has_more=len(rows) > filters.limit,
         )
 
-    def list_audit_events(self, terms_id: uuid.UUID, limit: int, offset: int) -> AuditListResponse:
-        rows = list(
-            self.db.scalars(
-                select(AuditEvent)
-                .where(AuditEvent.finance_terms_id == terms_id)
-                .order_by(AuditEvent.id)
-                .offset(offset)
-                .limit(limit + 1)
-            )
-        )
+    def list_audit_events(
+        self, finance_terms_id: uuid.UUID | None = None, *, limit: int = 20, offset: int = 0
+    ) -> AuditListResponse:
+        query = select(AuditEvent)
+        if finance_terms_id is not None:
+            query = query.where(AuditEvent.finance_terms_id == finance_terms_id)
+        rows = list(self.db.scalars(query.order_by(AuditEvent.id).offset(offset).limit(limit + 1)))
 
         return AuditListResponse(data=rows[:limit], has_more=len(rows) > limit)
 

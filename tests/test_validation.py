@@ -1,6 +1,6 @@
 """Contract checks without a database."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -61,6 +61,16 @@ def test_policy_name_is_required():
         PolicyCreate(insured_name="Business", premium="100", tax_fee="0")
 
 
+def test_due_date_accepts_dates_but_rejects_numeric_timestamps():
+    """The API contract accepts Python dates but rejects numeric date input."""
+    policies = [{"name": "Auto", "insured_name": "Business", "premium": "100", "tax_fee": "0"}]
+    future = date.today() + timedelta(days=1)
+
+    assert FinanceTermsCreate(due_date=future, policies=policies).due_date == future
+    with pytest.raises(ValidationError, match="YYYY-MM-DD"):
+        FinanceTermsCreate(due_date=1893456000, policies=policies)
+
+
 def test_policy_downpayment_overflow_is_rejected():
     """A calculated policy downpayment cannot exceed the storage limit."""
     with pytest.raises(ValidationError, match="Policy downpayment"):
@@ -95,3 +105,13 @@ def test_framework_http_errors_keep_standard_response_and_request_id(method, pat
     if code == 405:
         assert "allow" in response.headers
     client.close()
+
+
+def test_openapi_documents_agreement_error_responses():
+    """The agreement endpoint documents its application error responses."""
+    responses = app.openapi()["paths"]["/finance-terms/{terms_id}/agree"]["post"]["responses"]
+
+    assert {"200", "404", "409", "422", "500"} <= responses.keys()
+    assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorResponse"
+    )

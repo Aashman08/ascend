@@ -40,7 +40,7 @@ def create(client: TestClient, premium="200.00", tax_fee="50.00") -> dict:
 
 def history(client, terms_id):
     """Return audit events for a finance-terms record."""
-    return client.get(f"/finance-terms/{terms_id}/audit").json()["data"]
+    return client.get(f"/audit?finance_terms_id={terms_id}").json()["data"]
 
 
 def test_create_terms_computes_amounts_and_audits_policy_snapshot(client: TestClient):
@@ -124,7 +124,7 @@ def test_agreement_retry_preserves_timestamp_and_records_outcome(client: TestCli
         second.headers["X-Request-ID"],
     ]
     assert first.headers["X-Request-ID"] != second.headers["X-Request-ID"]
-    page = client.get(f"/finance-terms/{terms['id']}/audit?limit=2&offset=1").json()
+    page = client.get(f"/audit?finance_terms_id={terms['id']}&limit=2&offset=1").json()
     assert [e["id"] for e in page["data"]] == [e["id"] for e in events[1:]]
     assert page["has_more"] is False
 
@@ -259,3 +259,28 @@ def test_client_context_releases_connection_and_rolls_back_uncommitted_changes(
             == terms["due_date"]
         )
     assert pool.checkedout() == 0
+
+
+def test_audit_lists_all_events_with_optional_terms_filter(client: TestClient):
+    """Global audit history paginates across terms; an optional ID narrows the results."""
+    assert client.get("/audit").json() == {"data": [], "has_more": False}
+    first = create(client)
+    second = create(client)
+    assert client.post(f"/finance-terms/{first['id']}/agree").status_code == 200
+
+    page = client.get("/audit?limit=2").json()
+    assert [event["finance_terms_id"] for event in page["data"]] == [first["id"], second["id"]]
+    assert page["has_more"] is True
+    next_page = client.get("/audit?limit=2&offset=2").json()
+    assert [(event["finance_terms_id"], event["action"]) for event in next_page["data"]] == [
+        (first["id"], "agree")
+    ]
+    assert next_page["has_more"] is False
+    events = page["data"] + next_page["data"]
+    assert [event["id"] for event in events] == sorted(event["id"] for event in events)
+
+    filtered = client.get("/audit", params={"finance_terms_id": first["id"]}).json()
+    assert [event["action"] for event in filtered["data"]] == ["create", "agree"]
+    assert all(event["finance_terms_id"] == first["id"] for event in filtered["data"])
+    assert filtered["has_more"] is False
+    assert client.get("/audit?finance_terms_id=not-a-uuid").status_code == 422
