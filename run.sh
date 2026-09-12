@@ -10,11 +10,15 @@ fail() {
     exit 1
 }
 
-command -v uv >/dev/null 2>&1 || fail "uv is not installed. See https://docs.astral.sh/uv/"
-command -v docker >/dev/null 2>&1 || fail "Docker is not installed."
+command -v uv >/dev/null 2>&1 || fail "uv is not installed. Install it from https://docs.astral.sh/uv/"
+command -v docker >/dev/null 2>&1 || fail "Docker is not installed. Install Docker Desktop."
 docker info >/dev/null 2>&1 || fail "Docker is not running. Start Docker Desktop and try again."
 
-[[ -f .env ]] || fail "Missing .env. Add DATABASE_URL and TEST_DATABASE_URL first."
+if [[ ! -f .env ]]; then
+    [[ -f .env.example ]] || fail "Missing both .env and .env.example."
+    printf 'Creating .env from .env.example...\n'
+    cp .env.example .env
+fi
 
 printf 'Starting PostgreSQL...\n'
 docker compose up -d --wait

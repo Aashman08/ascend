@@ -61,7 +61,8 @@ test database. Pricing and validation tests should not require database access.
 
 ## Configuration
 
-Create a local `.env` file from the checked-in template:
+The `run.sh` script creates a local `.env` from the checked-in template when one
+does not exist. To create it manually:
 
 ```bash
 cp .env.example .env

@@ -7,8 +7,67 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.schemas import FinanceTermsCreate, PolicyCreate
+from app.schemas import FinanceTermsCreate, FinanceTermsFilters, PolicyCreate
 from app.server import app
+
+
+@pytest.mark.parametrize(
+    "field,value,message,error_type",
+    [
+        ("premium", "-1.00", "premium must be a positive value (greater than 0)", "greater_than"),
+        ("premium", 0, "premium must be a positive value (greater than 0)", "greater_than"),
+        ("tax_fee", "-1.00", "tax_fee must be zero or greater", "greater_than_equal"),
+        ("tax_fee", -1, "tax_fee must be zero or greater", "greater_than_equal"),
+    ],
+)
+def test_policy_amount_errors_name_the_field(field, value, message, error_type):
+    policy = {"name": "Auto", "insured_name": "Business", "premium": "100", "tax_fee": "0"}
+    policy[field] = value
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/finance-terms",
+            json={"due_date": datetime.now(UTC).date().isoformat(), "policies": [policy]},
+        )
+        assert response.status_code == 422
+        error = response.json()["detail"][0]
+        assert error["loc"] == ["body", "policies", 0, field]
+        assert error["msg"] == message
+        assert error["type"] == error_type
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("field", ["downpayment_gt", "downpayment_lt", "downpayment_eq"])
+def test_negative_downpayment_filter_names_the_field(field):
+    client = TestClient(app)
+    try:
+        response = client.get("/finance-terms", params={field: "-1"})
+        assert response.status_code == 422
+        error = response.json()["detail"][0]
+        assert error["loc"] == ["query", field]
+        assert error["msg"] == f"{field} must be zero or greater"
+        assert getattr(FinanceTermsFilters(**{field: "0"}), field) == 0
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("field", ["premium", "tax_fee"])
+@pytest.mark.parametrize(
+    "value,error_type",
+    [
+        ("abc", "decimal_parsing"),
+        ("NaN", "finite_number"),
+        ("1.234", "decimal_max_places"),
+        ("10000000000", "less_than_equal"),
+    ],
+)
+def test_other_amount_constraints_are_preserved(field, value, error_type):
+    policy = {"name": "Auto", "insured_name": "Business", "premium": "100", "tax_fee": "0"}
+    policy[field] = value
+    with pytest.raises(ValidationError) as caught:
+        PolicyCreate(**policy)
+    assert caught.value.errors()[0]["type"] == error_type
 
 
 @pytest.mark.parametrize(

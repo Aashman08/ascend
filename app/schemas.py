@@ -10,9 +10,13 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationError,
+    ValidationInfo,
+    ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from app import pricing
 from app.models import TermsStatus
@@ -24,6 +28,26 @@ class PolicyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200, examples=["Commercial Auto 2026"])
     premium: Decimal = Field(gt=0, le=pricing.MAX_AMOUNT, decimal_places=2)
     tax_fee: Decimal = Field(ge=0, le=pricing.MAX_AMOUNT, decimal_places=2)
+
+    @field_validator("premium", "tax_fee", mode="wrap")
+    @classmethod
+    def amount_sign_message(
+        cls, value: object, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+    ) -> Decimal:
+        try:
+            return handler(value)
+        except ValidationError as exc:
+            error = exc.errors()[0]
+            if error["type"] in {"greater_than", "greater_than_equal"}:
+                rule = (
+                    "a positive value (greater than 0)"
+                    if info.field_name == "premium"
+                    else "zero or greater"
+                )
+                raise PydanticCustomError(
+                    error["type"], f"{info.field_name} must be {rule}", error["ctx"]
+                ) from exc
+            raise
 
     @model_validator(mode="after")
     def downpayment_fits_storage(self) -> "PolicyCreate":
@@ -82,6 +106,21 @@ class FinanceTermsFilters(BaseModel):
     order: SortOrder = SortOrder.asc
     limit: int = Field(20, ge=1, le=100)
     offset: int = Field(0, ge=0)
+
+    @field_validator("downpayment_gt", "downpayment_lt", "downpayment_eq", mode="wrap")
+    @classmethod
+    def downpayment_sign_message(
+        cls, value: object, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+    ) -> Decimal | None:
+        try:
+            return handler(value)
+        except ValidationError as exc:
+            error = exc.errors()[0]
+            if error["type"] == "greater_than_equal":
+                raise PydanticCustomError(
+                    error["type"], f"{info.field_name} must be zero or greater", error["ctx"]
+                ) from exc
+            raise
 
     @model_validator(mode="after")
     def filters_are_consistent(self) -> "FinanceTermsFilters":
