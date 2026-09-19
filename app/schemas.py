@@ -1,6 +1,8 @@
 """Request validation and public response contracts. Money serializes as strings."""
 
 import enum
+import hashlib
+import json
 import re
 import uuid
 from datetime import UTC, date, datetime
@@ -83,6 +85,11 @@ class FinanceTermsCreate(BaseModel):
     def total_downpayment_fits_storage(self) -> "FinanceTermsCreate":
         pricing.validate_total_downpayment((p.premium, p.tax_fee) for p in self.policies)
         return self
+
+    def fingerprint(self) -> str:
+        """SHA-256 of the validated payload in canonical JSON, for Idempotency-Key reuse checks."""
+        canonical = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 class SortField(str, enum.Enum):

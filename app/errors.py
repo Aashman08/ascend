@@ -32,3 +32,13 @@ class FinanceTermsNotFoundError(NotFoundError):
 
 class TermsExpiredError(InvalidStateError):
     message = "These terms have expired. Create new terms with a current due date."
+
+
+class IdempotencyConflictError(InvalidStateError):
+    error_type = "idempotency_conflict"
+
+    def __init__(self, key: str) -> None:
+        super().__init__(
+            f"Idempotency-Key '{key}' was already used with a different request body. "
+            "Retry with the original body or use a new key."
+        )

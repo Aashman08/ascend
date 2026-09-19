@@ -112,3 +112,18 @@ class AuditEvent(Base):
     )
     request_id: Mapped[str | None] = mapped_column(String(200))
     details: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+
+class IdempotencyKey(Base):
+    """Maps a client-supplied Idempotency-Key to the finance terms it created."""
+
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(200), primary_key=True)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    finance_terms_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("finance_terms.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

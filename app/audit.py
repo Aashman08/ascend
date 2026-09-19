@@ -68,3 +68,17 @@ def record_agree_event(
 ) -> None:
     """Record an agreement attempt while keeping its outcome explicit."""
     record_event(db, terms_id, "agree", outcome, request_id, details)
+
+
+def record_create_replay_event(
+    db: Session, terms_id: uuid.UUID, idempotency_key: str, request_id: str
+) -> None:
+    """Record that a repeated Idempotency-Key returned the existing terms unchanged."""
+    record_event(
+        db,
+        terms_id,
+        "create",
+        "unchanged",
+        request_id,
+        {"reason": "idempotent_replay", "idempotency_key": idempotency_key},
+    )
