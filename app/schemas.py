@@ -92,6 +92,14 @@ class FinanceTermsCreate(BaseModel):
         return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+class CancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    reason: str = Field(
+        min_length=1, max_length=500, examples=["Customer chose another carrier"]
+    )
+
+
 class SortField(str, enum.Enum):
     downpayment = "downpayment"
     due_date = "due_date"
@@ -166,6 +174,8 @@ class FinanceTermsResponse(BaseModel):
     total_amount: Decimal
     amount_financed: Decimal
     agreed_at: datetime | None
+    cancelled_at: datetime | None
+    cancel_reason: str | None
     created_at: datetime
     updated_at: datetime
     policies: list[PolicyResponse]

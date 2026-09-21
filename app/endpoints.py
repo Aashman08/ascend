@@ -8,6 +8,7 @@ from fastapi import APIRouter, Header, Query, Request, Response, status
 from app.client import create_finance_terms_client
 from app.schemas import (
     AuditListResponse,
+    CancelRequest,
     FinanceTermsCreate,
     FinanceTermsFilters,
     FinanceTermsListResponse,
@@ -17,7 +18,14 @@ from app.schemas import (
 
 router = APIRouter()
 ERROR_404 = {"model": ErrorResponse, "description": "Resource not found."}
-ERROR_409 = {"model": ErrorResponse, "description": "Terms have expired and cannot be agreed."}
+ERROR_409 = {
+    "model": ErrorResponse,
+    "description": "Terms have expired or been cancelled and cannot be agreed.",
+}
+ERROR_409_CANCEL = {
+    "model": ErrorResponse,
+    "description": "Terms have already been agreed and cannot be cancelled.",
+}
 ERROR_409_IDEMPOTENCY = {
     "model": ErrorResponse,
     "description": "Idempotency-Key was already used with a different request body.",
@@ -91,6 +99,19 @@ def get_finance_terms(terms_id: uuid.UUID, request: Request) -> FinanceTermsResp
 def agree_finance_terms(terms_id: uuid.UUID, request: Request) -> FinanceTermsResponse:
     with create_finance_terms_client(request.state.request_id) as client:
         return client.agree_finance_terms(terms_id)
+
+
+@router.post(
+    "/finance-terms/{terms_id}/cancel",
+    tags=["Finance Terms"],
+    response_model=FinanceTermsResponse,
+    responses={404: ERROR_404, 409: ERROR_409_CANCEL, 500: ERROR_500},
+)
+def cancel_finance_terms(
+    terms_id: uuid.UUID, payload: CancelRequest, request: Request
+) -> FinanceTermsResponse:
+    with create_finance_terms_client(request.state.request_id) as client:
+        return client.cancel_finance_terms(terms_id, payload)
 
 
 @router.get(

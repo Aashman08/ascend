@@ -60,6 +60,7 @@ and evaluated in UTC. Replace the example due date if it is in the past.
 | `GET` | `/finance-terms` | List terms with filtering, sorting, and pagination. |
 | `GET` | `/finance-terms/{id}` | Fetch one finance-terms record. |
 | `POST` | `/finance-terms/{id}/agree` | Agree to pending terms. |
+| `POST` | `/finance-terms/{id}/cancel` | Cancel pending terms with a reason. |
 | `GET` | `/audit` | List audit events or filter by finance-terms ID. |
 | `GET` | `/health` | Check whether the API is running. |
 
@@ -133,14 +134,34 @@ curl -sS -X POST 'http://localhost:8000/finance-terms/<id>/agree'
 ```
 
 Returns HTTP 200 with `status="agreed"` and the acceptance time in both
-`agreed_at` and `updated_at`. A missing ID returns HTTP 404. Expired terms return
-HTTP 409. Repeating an agreement returns HTTP 200 with the original timestamp.
+`agreed_at` and `updated_at`. A missing ID returns HTTP 404. Expired or cancelled
+terms return HTTP 409. Repeating an agreement returns HTTP 200 with the original
+timestamp.
 
-Doing nothing leaves a pending record unchanged. Declining, editing, and canceling
-terms are not supported. Business actions and their outcomes are recorded in the
-audit history. Retries and rejections do not change the terms or their timestamps.
+Doing nothing leaves a pending record unchanged. Editing terms is not supported;
+revised terms are a new agreement. Business actions and their outcomes are recorded
+in the audit history. Retries and rejections do not change the terms or their timestamps.
 Each acceptance request gets its own audit event: the first acceptance records
 `agree / succeeded`, and subsequent requests record `agree / unchanged`.
+
+### 3b. Cancel terms
+
+Cancel pending terms the customer no longer wants. The body carries a required
+reason, trimmed, 1–500 characters.
+
+```bash
+curl -sS -X POST 'http://localhost:8000/finance-terms/<id>/cancel' \
+  -H 'Content-Type: application/json' \
+  -d '{"reason": "Customer chose another carrier"}'
+```
+
+Returns HTTP 200 with `status="cancelled"`, the reason in `cancel_reason`, and the
+cancellation time in both `cancelled_at` and `updated_at`. Repeating a cancellation
+returns HTTP 200 with the original timestamp and reason; a different reason on a
+retry is ignored. Agreed terms cannot be cancelled and return HTTP 409; cancelling
+already-agreed terms needs separate business rules. Expired pending terms may still
+be cancelled, since expiry only blocks agreement. Cancelled terms cannot be agreed
+and return HTTP 409. A missing ID returns HTTP 404.
 
 ### 4. List, filter, and sort
 
@@ -166,7 +187,7 @@ curl -sS 'http://localhost:8000/finance-terms?downpayment_lt=500&sort=downpaymen
 | Parameter | Values |
 |---|---|
 | `downpayment_gt`, `downpayment_lt`, `downpayment_eq` | Nonnegative decimal amount; equality cannot combine with range filters |
-| `status` | `pending` or `agreed` |
+| `status` | `pending`, `agreed`, or `cancelled` |
 | `sort` | `downpayment` or `due_date` (default) |
 | `order` | `asc` (default) or `desc` |
 | `limit` | 1–100, default 20 |
@@ -206,7 +227,10 @@ inspection of rejected attempts; an ID with no history returns an empty list.
 | `create` | `rejected` | Repeated `Idempotency-Key` with a different body |
 | `agree` | `succeeded` | Previous/new status and acceptance timestamp |
 | `agree` | `unchanged` | Retry of an already accepted agreement |
-| `agree` | `rejected` | Expired terms or nonexistent terms ID |
+| `agree` | `rejected` | Expired terms, cancelled terms, or nonexistent terms ID |
+| `cancel` | `succeeded` | Previous/new status, cancellation timestamp, and reason |
+| `cancel` | `unchanged` | Retry of an already cancelled agreement |
+| `cancel` | `rejected` | Already agreed terms or nonexistent terms ID |
 
 Successful mutations and their audit events commit together. An audit write failure
 rolls back the mutation. Business rejections commit their event before returning
@@ -247,10 +271,12 @@ This project uses SQLAlchemy models backed by PostgreSQL; it does not use Prisma
 | Field | PostgreSQL type | Notes |
 |---|---|---|
 | `id` | `UUID` | Primary key. |
-| `status` | `terms_status` enum | `pending` or `agreed`. |
+| `status` | `terms_status` enum | `pending`, `agreed`, or `cancelled`. |
 | `due_date` | `DATE` | Terms expiry date. |
 | `total_downpayment` | `NUMERIC(12,2)` | Total amount due upfront. |
 | `agreed_at` | `TIMESTAMPTZ` | Nullable until terms are agreed. |
+| `cancelled_at` | `TIMESTAMPTZ` | Nullable until terms are cancelled. |
+| `cancel_reason` | `VARCHAR(500)` | Required when cancelled, otherwise null. |
 | `created_at` | `TIMESTAMPTZ` | Database-generated creation time. |
 | `updated_at` | `TIMESTAMPTZ` | Database-generated update time. |
 
@@ -273,7 +299,7 @@ This project uses SQLAlchemy models backed by PostgreSQL; it does not use Prisma
 |---|---|---|
 | `id` | `BIGINT` identity | Primary key. |
 | `finance_terms_id` | `UUID` | No foreign key; missing IDs can be audited. |
-| `action` | `VARCHAR(20)` | `create` or `agree`. |
+| `action` | `VARCHAR(20)` | `create`, `agree`, or `cancel`. |
 | `outcome` | `VARCHAR(20)` | `succeeded`, `unchanged`, or `rejected`. |
 | `occurred_at` | `TIMESTAMPTZ` | Database-generated event time. |
 | `request_id` | `VARCHAR(200)` | Server-generated request ID. |
@@ -296,10 +322,10 @@ record is deleted.
 
 | Module | Responsibility |
 |---|---|
-| `app/models.py` | SQLAlchemy models for finance terms, policies, and audit events. Database constraints enforce status/timestamp consistency. |
+| `app/models.py` | SQLAlchemy models for finance terms, policies, and audit events, plus the `TermsStatus`, `AuditAction`, and `AuditOutcome` enums. |
 | `app/pricing.py` | `Decimal` calculations at a fixed 20% rate, `ROUND_HALF_UP` rounding, and amount-limit rules. |
 | `app/schemas.py` | Request body/query validation and API response contracts. |
-| `app/client.py` | Finance-terms operations, row locking, transactions, and audit recording. |
+| `app/client.py` | Finance-terms operations, row locking, transactions, audit recording, and the status/timestamp consistency check run before every state-changing commit. |
 | `app/serializers.py` | Converts database models into typed API response models. |
 | `app/endpoints.py` | HTTP route definitions for finance terms, audit history, and health checks. |
 | `app/audit.py` | Transactional audit event insertion. |
@@ -311,7 +337,12 @@ record is deleted.
 | `migrations/` | Numbered SQL files defining schema changes. |
 
 Indexes support downpayment and due-date queries, policy lookup by parent, and audit
-history by terms ID/event ID. Status has no standalone index. Policy names are
+history by terms ID/event ID. Status has no standalone index.
+
+The database enforces structure only: primary and foreign keys, `NOT NULL`,
+non-negative amounts, and non-blank names. Business rules such as which timestamps
+a status requires and which audit actions exist live in the application, so adding
+a state or an action is a code change rather than a constraint rewrite. Policy names are
 checkout labels; a product catalog is not modeled.
 
 ## Errors
@@ -319,7 +350,7 @@ checkout labels; a product catalog is not modeled.
 | HTTP status | Error type | Meaning | Response shape |
 |---:|---|---|---|
 | `404` | `not_found` | Requested finance terms do not exist. | Application error |
-| `409` | `invalid_state` | Finance terms have expired and cannot be agreed. | Application error |
+| `409` | `invalid_state` | Terms have expired or been cancelled and cannot be agreed, or are agreed and cannot be cancelled. | Application error |
 | `409` | `idempotency_conflict` | `Idempotency-Key` was already used with a different request body. | Application error |
 | `422` | `validation_error` | Request body, query parameter, or path parameter is invalid. | FastAPI standard response |
 | `405` | — | HTTP method is not supported for the route. | FastAPI standard response |
@@ -394,10 +425,9 @@ implementation order:
    Request IDs would continue to identify individual calls, independently of actor
    identity.
 
-2. **Cancellation and replacement terms:** Allow pending terms to be cancelled,
-   prevent subsequent acceptance, and audit the action and reason. Revised terms
-   would form a new agreement linked to the original, preserving its policies and
-   history; cancellation of already agreed terms needs separate business rules.
+2. **Replacement terms:** Revised terms would form a new agreement linked to the
+   cancelled original, preserving its policies and history. Cancellation of already
+   agreed terms needs separate business rules and possibly a refund flow.
 
 3. **Payment tracking:** Integrate a payment provider to track downpayment
    collection, failed payments, and refunds. Payment status would be tracked

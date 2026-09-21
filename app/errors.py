@@ -42,3 +42,11 @@ class IdempotencyConflictError(InvalidStateError):
             f"Idempotency-Key '{key}' was already used with a different request body. "
             "Retry with the original body or use a new key."
         )
+
+
+class TermsCancelledError(InvalidStateError):
+    message = "These terms have been cancelled. Create new terms to continue."
+
+
+class TermsAlreadyAgreedError(InvalidStateError):
+    message = "These terms have already been agreed and cannot be cancelled."

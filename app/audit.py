@@ -4,14 +4,14 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.models import AuditEvent, FinanceTerms
+from app.models import AuditAction, AuditEvent, AuditOutcome, FinanceTerms
 from app.pricing import DOWNPAYMENT_RATE, TermsTotals
 
 def record_event(
     db: Session,
     terms_id: uuid.UUID,
-    action: str,
-    outcome: str,
+    action: AuditAction,
+    outcome: AuditOutcome,
     request_id: str | None,
     details: dict,
 ) -> None:
@@ -19,8 +19,8 @@ def record_event(
     db.add(
         AuditEvent(
             finance_terms_id=terms_id,
-            action=action,
-            outcome=outcome,
+            action=AuditAction(action).value,
+            outcome=AuditOutcome(outcome).value,
             request_id=request_id,
             details=details,
         )
@@ -34,8 +34,8 @@ def record_create_event(
     record_event(
         db,
         terms.id,
-        "create",
-        "succeeded",
+        AuditAction.create,
+        AuditOutcome.succeeded,
         request_id,
         {
             "status": "pending",
@@ -63,11 +63,11 @@ def record_agree_event(
     db: Session,
     terms_id: uuid.UUID,
     request_id: str,
-    outcome: str,
+    outcome: AuditOutcome,
     details: dict,
 ) -> None:
     """Record an agreement attempt while keeping its outcome explicit."""
-    record_event(db, terms_id, "agree", outcome, request_id, details)
+    record_event(db, terms_id, AuditAction.agree, outcome, request_id, details)
 
 
 def record_create_replay_event(
@@ -77,8 +77,19 @@ def record_create_replay_event(
     record_event(
         db,
         terms_id,
-        "create",
-        "unchanged",
+        AuditAction.create,
+        AuditOutcome.unchanged,
         request_id,
         {"reason": "idempotent_replay", "idempotency_key": idempotency_key},
     )
+
+
+def record_cancel_event(
+    db: Session,
+    terms_id: uuid.UUID,
+    request_id: str,
+    outcome: AuditOutcome,
+    details: dict,
+) -> None:
+    """Record a cancellation attempt while keeping its outcome explicit."""
+    record_event(db, terms_id, AuditAction.cancel, outcome, request_id, details)

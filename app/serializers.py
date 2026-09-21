@@ -17,6 +17,8 @@ def finance_terms_response(terms: FinanceTerms) -> FinanceTermsResponse:
         total_amount=total,
         amount_financed=amount_financed(total, terms.total_downpayment),
         agreed_at=terms.agreed_at,
+        cancelled_at=terms.cancelled_at,
+        cancel_reason=terms.cancel_reason,
         created_at=terms.created_at,
         updated_at=terms.updated_at,
         policies=policies,
