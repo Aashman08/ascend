@@ -115,6 +115,7 @@ class FinanceTermsClient:
         stored = self.db.get(IdempotencyKey, idempotency_key)
         if stored is None:
             return None
+        # checking for duplicate payload with same key
         if stored.request_hash != fingerprint:
             record_event(
                 self.db,
