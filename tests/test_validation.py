@@ -10,6 +10,8 @@ from pydantic import ValidationError
 from app.schemas import FinanceTermsCreate, FinanceTermsFilters, PolicyCreate
 from app.server import app
 
+PAYOFF = (datetime.now(UTC).date() + timedelta(days=300)).isoformat()
+
 
 @pytest.mark.parametrize(
     "field,value,message,error_type",
@@ -27,7 +29,7 @@ def test_policy_amount_errors_name_the_field(field, value, message, error_type):
     try:
         response = client.post(
             "/finance-terms",
-            json={"due_date": datetime.now(UTC).date().isoformat(), "policies": [policy]},
+            json={"due_date": datetime.now(UTC).date().isoformat(), "payoff_date": PAYOFF, "policies": [policy]},
         )
         assert response.status_code == 422
         error = response.json()["detail"][0]
@@ -85,6 +87,7 @@ def test_due_date_format_and_past_date_have_distinct_errors(due_date, message):
             "/finance-terms",
             json={
                 "due_date": due_date,
+                "payoff_date": PAYOFF,
                 "policies": [
                     {"name": "Auto", "insured_name": "Business", "premium": "100", "tax_fee": "0"}
                 ],
@@ -102,6 +105,7 @@ def test_due_date_accepts_today_in_iso_format():
     today = datetime.now(UTC).date()
     terms = FinanceTermsCreate(
         due_date=today.isoformat(),
+        payoff_date=PAYOFF,
         policies=[{"name": "Auto", "insured_name": "Business", "premium": "100", "tax_fee": "0"}],
     )
     assert terms.due_date == today
@@ -125,9 +129,9 @@ def test_due_date_accepts_dates_but_rejects_numeric_timestamps():
     policies = [{"name": "Auto", "insured_name": "Business", "premium": "100", "tax_fee": "0"}]
     future = date.today() + timedelta(days=1)
 
-    assert FinanceTermsCreate(due_date=future, policies=policies).due_date == future
+    assert FinanceTermsCreate(due_date=future, payoff_date=PAYOFF, policies=policies).due_date == future
     with pytest.raises(ValidationError, match="YYYY-MM-DD"):
-        FinanceTermsCreate(due_date=1893456000, policies=policies)
+        FinanceTermsCreate(due_date=1893456000, payoff_date=PAYOFF, policies=policies)
 
 
 def test_policy_downpayment_overflow_is_rejected():
@@ -147,7 +151,7 @@ def test_aggregate_downpayment_overflow_is_rejected():
         "tax_fee": "5000000000.00",
     }
     with pytest.raises(ValidationError, match="Total downpayment"):
-        FinanceTermsCreate(due_date=datetime.now(UTC).date(), policies=[policy, policy])
+        FinanceTermsCreate(due_date=datetime.now(UTC).date(), payoff_date=PAYOFF, policies=[policy, policy])
 
 
 @pytest.mark.parametrize(

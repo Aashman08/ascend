@@ -3,22 +3,57 @@
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app.audit import record_agree_event, record_create_event
+from app import payment_provider
+from app.audit import (
+    record_agree_event,
+    record_cancel_event,
+    record_create_event,
+    record_create_replay_event,
+    record_event,
+    record_payment_event,
+)
 from app.database import SessionLocal
-from app.errors import FinanceTermsNotFoundError, TermsExpiredError
-from app.models import AuditEvent, FinanceTerms, Policy, TermsStatus
+from app.errors import (
+    FinanceTermsNotFoundError,
+    IdempotencyConflictError,
+    InstallmentAlreadyCancelledError,
+    InstallmentAlreadyPaidError,
+    InstallmentNotFoundError,
+    PaymentDeclinedError,
+    TermsAlreadyAgreedError,
+    TermsCancelledError,
+    TermsExpiredError,
+    TermsNotAgreedError,
+)
+from app.installments import installment_response, installment_rows, ledger_response, ledger_summary
+from app.models import (
+    AuditAction,
+    AuditEvent,
+    AuditOutcome,
+    FinanceTerms,
+    IdempotencyKey,
+    InstallmentStatus,
+    Policy,
+    TermsStatus,
+)
 from app.pricing import compute_totals, policy_downpayment
 from app.schemas import (
     AuditListResponse,
+    CancelRequest,
     FinanceTermsCreate,
     FinanceTermsFilters,
     FinanceTermsListResponse,
     FinanceTermsResponse,
+    LedgerResponse,
+    PaymentRequest,
+    PaymentResponse,
     SortField,
     SortOrder,
 )
@@ -32,10 +67,20 @@ class FinanceTermsClient:
         self.db = db
         self.request_id = request_id
 
-    def create_finance_terms(self, payload: FinanceTermsCreate) -> FinanceTermsResponse:
+    def create_finance_terms(
+        self, payload: FinanceTermsCreate, idempotency_key: str | None = None
+    ) -> "CreationResult":
+        """Create terms; with an Idempotency-Key, a repeated request returns the original."""
+        fingerprint = payload.fingerprint()
+        if idempotency_key is not None:
+            existing = self._replay_idempotent_create(idempotency_key, fingerprint)
+            if existing is not None:
+                return CreationResult(existing, replayed=True)
+
         totals = compute_totals([(p.premium, p.tax_fee) for p in payload.policies])
         terms = FinanceTerms(
             due_date=payload.due_date,
+            payoff_date=payload.payoff_date,
             status=TermsStatus.pending,
             total_downpayment=totals.total_downpayment,
             policies=[
@@ -51,9 +96,54 @@ class FinanceTermsClient:
         )
         self.db.add(terms)
         self.db.flush()
+        if idempotency_key is not None:
+            # The primary key on idempotency_keys is the arbiter under concurrency: a
+            # second request with the same new key blocks here until the first commits,
+            # then fails with a unique violation and falls back to replaying the winner.
+            self.db.add(
+                IdempotencyKey(
+                    key=idempotency_key, request_hash=fingerprint, finance_terms_id=terms.id
+                )
+            )
         record_create_event(self.db, terms, totals, self.request_id)
+        try:
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            if (
+                idempotency_key is not None
+                and _is_idempotency_key_conflict(exc)
+            ):
+                existing = self._replay_idempotent_create(idempotency_key, fingerprint)
+                if existing is None:  # The winner vanished; nothing sensible to replay.
+                    raise
+                return CreationResult(existing, replayed=True)
+            raise
+        return CreationResult(finance_terms_response(terms), replayed=False)
+
+    def _replay_idempotent_create(
+        self, idempotency_key: str, fingerprint: str
+    ) -> FinanceTermsResponse | None:
+        """Return the terms originally created with this key, or None if the key is new."""
+        stored = self.db.get(IdempotencyKey, idempotency_key)
+        if stored is None:
+            return None
+        if stored.request_hash != fingerprint:
+            record_event(
+                self.db,
+                stored.finance_terms_id,
+                AuditAction.create,
+                AuditOutcome.rejected,
+                self.request_id,
+                {"reason": "idempotency_key_reused", "idempotency_key": idempotency_key},
+            )
+            self.db.commit()
+            raise IdempotencyConflictError(idempotency_key)
+        record_create_replay_event(
+            self.db, stored.finance_terms_id, idempotency_key, self.request_id
+        )
         self.db.commit()
-        return finance_terms_response(terms)
+        return self.get_finance_terms(stored.finance_terms_id)
 
     def get_finance_terms(self, terms_id: uuid.UUID) -> FinanceTermsResponse:
         terms = self.db.scalar(
@@ -75,17 +165,31 @@ class FinanceTermsClient:
                 self.db,
                 terms_id,
                 self.request_id,
-                "rejected",
+                AuditOutcome.rejected,
                 {"reason": "finance_terms_not_found"},
             )
             self.db.commit()
             raise FinanceTermsNotFoundError(terms_id)
+        if terms.status == TermsStatus.cancelled:
+            record_agree_event(
+                self.db,
+                terms_id,
+                self.request_id,
+                AuditOutcome.rejected,
+                {
+                    "status": "cancelled",
+                    "reason": "terms_cancelled",
+                    "cancelled_at": terms.cancelled_at.isoformat(),
+                },
+            )
+            self.db.commit()
+            raise TermsCancelledError()
         if terms.status == TermsStatus.agreed:
             record_agree_event(
                 self.db,
                 terms_id,
                 self.request_id,
-                "unchanged",
+                AuditOutcome.unchanged,
                 {"status": "agreed", "agreed_at": terms.agreed_at.isoformat()},
             )
         elif terms.due_date < datetime.now(UTC).date():
@@ -93,7 +197,7 @@ class FinanceTermsClient:
                 self.db,
                 terms_id,
                 self.request_id,
-                "rejected",
+                AuditOutcome.rejected,
                 {
                     "status": "pending",
                     "reason": "terms_expired",
@@ -105,19 +209,169 @@ class FinanceTermsClient:
         else:
             terms.status = TermsStatus.agreed
             terms.agreed_at = terms.updated_at = datetime.now(UTC)
+            terms.installments = installment_rows(terms)
             record_agree_event(
                 self.db,
                 terms_id,
                 self.request_id,
-                "succeeded",
+                AuditOutcome.succeeded,
                 {
                     "from_status": "pending",
                     "to_status": "agreed",
                     "agreed_at": terms.agreed_at.isoformat(),
+                    "installments": len(terms.installments),
                 },
             )
+        check_state_consistency(terms)
         self.db.commit()
         return finance_terms_response(terms)
+
+    def cancel_finance_terms(
+        self, terms_id: uuid.UUID, payload: CancelRequest
+    ) -> FinanceTermsResponse:
+        # Same row lock as agreement, so agree and cancel serialize against each other.
+        terms = self.db.scalar(
+            select(FinanceTerms).where(FinanceTerms.id == terms_id).with_for_update()
+        )
+        if terms is None:
+            record_cancel_event(
+                self.db,
+                terms_id,
+                self.request_id,
+                AuditOutcome.rejected,
+                {"reason": "finance_terms_not_found"},
+            )
+            self.db.commit()
+            raise FinanceTermsNotFoundError(terms_id)
+        if terms.status == TermsStatus.cancelled:
+            record_cancel_event(
+                self.db,
+                terms_id,
+                self.request_id,
+                AuditOutcome.unchanged,
+                {
+                    "status": "cancelled",
+                    "cancelled_at": terms.cancelled_at.isoformat(),
+                    "cancel_reason": terms.cancel_reason,
+                },
+            )
+        elif terms.status == TermsStatus.agreed:
+            record_cancel_event(
+                self.db,
+                terms_id,
+                self.request_id,
+                AuditOutcome.rejected,
+                {
+                    "status": "agreed",
+                    "reason": "terms_already_agreed",
+                    "agreed_at": terms.agreed_at.isoformat(),
+                },
+            )
+            self.db.commit()
+            raise TermsAlreadyAgreedError()
+        else:
+            # Expired pending terms may still be cancelled; expiry only blocks agreement.
+            terms.status = TermsStatus.cancelled
+            terms.cancel_reason = payload.reason
+            terms.cancelled_at = terms.updated_at = datetime.now(UTC)
+            for row in terms.installments:
+                if row.status == InstallmentStatus.pending:
+                    row.status = InstallmentStatus.cancelled
+                    row.updated_at = terms.cancelled_at
+            record_cancel_event(
+                self.db,
+                terms_id,
+                self.request_id,
+                AuditOutcome.succeeded,
+                {
+                    "from_status": "pending",
+                    "to_status": "cancelled",
+                    "cancelled_at": terms.cancelled_at.isoformat(),
+                    "reason": payload.reason,
+                },
+            )
+        check_state_consistency(terms)
+        self.db.commit()
+        return finance_terms_response(terms)
+
+    def get_ledger(self, terms_id: uuid.UUID) -> LedgerResponse:
+        terms = self.db.scalar(
+            select(FinanceTerms)
+            .options(selectinload(FinanceTerms.installments))
+            .where(FinanceTerms.id == terms_id)
+        )
+        if terms is None:
+            raise FinanceTermsNotFoundError(terms_id)
+        return ledger_response(terms)
+
+    def pay_installment(
+        self, terms_id: uuid.UUID, installment_id: int, payload: PaymentRequest | None
+    ) -> PaymentResponse:
+        """Charge one installment through the provider and mark it paid on approval."""
+        reference = payload.reference if payload is not None else None
+        # Lock the terms row: concurrent charges for one installment serialize here,
+        # so the second attempt sees "paid" instead of charging the customer twice.
+        terms = self.db.scalar(
+            select(FinanceTerms).where(FinanceTerms.id == terms_id).with_for_update()
+        )
+
+        def reject(reason: str, **extra: object) -> None:
+            record_payment_event(
+                self.db,
+                terms_id,
+                self.request_id,
+                AuditOutcome.rejected,
+                {"installment_id": installment_id, "reason": reason, **extra},
+            )
+            self.db.commit()
+
+        if terms is None:
+            reject("finance_terms_not_found")
+            raise FinanceTermsNotFoundError(terms_id)
+        if terms.status != TermsStatus.agreed:
+            reject("terms_not_agreed", status=terms.status.value)
+            raise TermsNotAgreedError()
+        row = next((r for r in terms.installments if r.installment_id == installment_id), None)
+        if row is None:
+            reject("installment_not_found")
+            raise InstallmentNotFoundError(installment_id, terms_id)
+        if row.status == InstallmentStatus.paid:
+            reject("installment_already_paid", paid_at=row.paid_at.isoformat())
+            raise InstallmentAlreadyPaidError()
+        if row.status == InstallmentStatus.cancelled:
+            reject("installment_cancelled")
+            raise InstallmentAlreadyCancelledError()
+
+        amount = row.installment_value + row.interest_value
+        result = payment_provider.charge(amount, reference)
+        if not result.approved:
+            reject(
+                result.reason or "declined_by_provider",
+                amount=str(amount),
+                reference=reference,
+                provider_reference=result.provider_reference,
+            )
+            raise PaymentDeclinedError()
+
+        row.status = InstallmentStatus.paid
+        row.paid_at = row.updated_at = datetime.now(UTC)
+        summary = ledger_summary(terms)
+        record_payment_event(
+            self.db,
+            terms_id,
+            self.request_id,
+            AuditOutcome.succeeded,
+            {
+                "installment_id": installment_id,
+                "amount": str(amount),
+                "reference": reference,
+                "provider_reference": result.provider_reference,
+                "paid_at": row.paid_at.isoformat(),
+                "balance_remaining": str(summary.balance_remaining),
+            },
+        )
+        self.db.commit()
+        return PaymentResponse(installment=installment_response(row), summary=summary)
 
     def list_finance_terms(self, filters: FinanceTermsFilters) -> FinanceTermsListResponse:
         query = select(FinanceTerms).options(selectinload(FinanceTerms.policies))
@@ -156,6 +410,42 @@ class FinanceTermsClient:
         rows = list(self.db.scalars(query.order_by(AuditEvent.id).offset(offset).limit(limit + 1)))
 
         return AuditListResponse(data=rows[:limit], has_more=len(rows) > limit)
+
+
+def check_state_consistency(terms: FinanceTerms) -> None:
+    """Application-owned invariant: each status implies exactly which fields are set.
+
+    This replaces a database check constraint. It runs before every state-changing
+    commit so a coding error cannot persist a contradictory row.
+    """
+    expected = {
+        TermsStatus.pending: (False, False, False),
+        TermsStatus.agreed: (True, False, False),
+        TermsStatus.cancelled: (False, True, True),
+    }[terms.status]
+    actual = (
+        terms.agreed_at is not None,
+        terms.cancelled_at is not None,
+        terms.cancel_reason is not None,
+    )
+    if actual != expected:
+        raise RuntimeError(
+            f"Inconsistent finance terms state for {terms.id}: status={terms.status.value}, "
+            f"agreed_at set={actual[0]}, cancelled_at set={actual[1]}, reason set={actual[2]}"
+        )
+
+
+@dataclass(frozen=True)
+class CreationResult:
+    """Outcome of a create request; replayed is True when an Idempotency-Key matched."""
+
+    terms: FinanceTermsResponse
+    replayed: bool
+
+
+def _is_idempotency_key_conflict(exc: IntegrityError) -> bool:
+    diag = getattr(exc.orig, "diag", None)
+    return getattr(diag, "constraint_name", None) == "idempotency_keys_pkey"
 
 
 @contextmanager
