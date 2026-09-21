@@ -10,27 +10,36 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from app import payment_provider
 from app.audit import (
     record_agree_event,
     record_cancel_event,
     record_create_event,
     record_create_replay_event,
     record_event,
+    record_payment_event,
 )
 from app.database import SessionLocal
 from app.errors import (
     FinanceTermsNotFoundError,
     IdempotencyConflictError,
+    InstallmentAlreadyCancelledError,
+    InstallmentAlreadyPaidError,
+    InstallmentNotFoundError,
+    PaymentDeclinedError,
     TermsAlreadyAgreedError,
     TermsCancelledError,
     TermsExpiredError,
+    TermsNotAgreedError,
 )
+from app.installments import installment_response, installment_rows, ledger_response, ledger_summary
 from app.models import (
     AuditAction,
     AuditEvent,
     AuditOutcome,
     FinanceTerms,
     IdempotencyKey,
+    InstallmentStatus,
     Policy,
     TermsStatus,
 )
@@ -42,6 +51,9 @@ from app.schemas import (
     FinanceTermsFilters,
     FinanceTermsListResponse,
     FinanceTermsResponse,
+    LedgerResponse,
+    PaymentRequest,
+    PaymentResponse,
     SortField,
     SortOrder,
 )
@@ -68,6 +80,7 @@ class FinanceTermsClient:
         totals = compute_totals([(p.premium, p.tax_fee) for p in payload.policies])
         terms = FinanceTerms(
             due_date=payload.due_date,
+            payoff_date=payload.payoff_date,
             status=TermsStatus.pending,
             total_downpayment=totals.total_downpayment,
             policies=[
@@ -196,6 +209,7 @@ class FinanceTermsClient:
         else:
             terms.status = TermsStatus.agreed
             terms.agreed_at = terms.updated_at = datetime.now(UTC)
+            terms.installments = installment_rows(terms)
             record_agree_event(
                 self.db,
                 terms_id,
@@ -205,6 +219,7 @@ class FinanceTermsClient:
                     "from_status": "pending",
                     "to_status": "agreed",
                     "agreed_at": terms.agreed_at.isoformat(),
+                    "installments": len(terms.installments),
                 },
             )
         check_state_consistency(terms)
@@ -259,6 +274,10 @@ class FinanceTermsClient:
             terms.status = TermsStatus.cancelled
             terms.cancel_reason = payload.reason
             terms.cancelled_at = terms.updated_at = datetime.now(UTC)
+            for row in terms.installments:
+                if row.status == InstallmentStatus.pending:
+                    row.status = InstallmentStatus.cancelled
+                    row.updated_at = terms.cancelled_at
             record_cancel_event(
                 self.db,
                 terms_id,
@@ -274,6 +293,85 @@ class FinanceTermsClient:
         check_state_consistency(terms)
         self.db.commit()
         return finance_terms_response(terms)
+
+    def get_ledger(self, terms_id: uuid.UUID) -> LedgerResponse:
+        terms = self.db.scalar(
+            select(FinanceTerms)
+            .options(selectinload(FinanceTerms.installments))
+            .where(FinanceTerms.id == terms_id)
+        )
+        if terms is None:
+            raise FinanceTermsNotFoundError(terms_id)
+        return ledger_response(terms)
+
+    def pay_installment(
+        self, terms_id: uuid.UUID, installment_id: int, payload: PaymentRequest | None
+    ) -> PaymentResponse:
+        """Charge one installment through the provider and mark it paid on approval."""
+        reference = payload.reference if payload is not None else None
+        # Lock the terms row: concurrent charges for one installment serialize here,
+        # so the second attempt sees "paid" instead of charging the customer twice.
+        terms = self.db.scalar(
+            select(FinanceTerms).where(FinanceTerms.id == terms_id).with_for_update()
+        )
+
+        def reject(reason: str, **extra: object) -> None:
+            record_payment_event(
+                self.db,
+                terms_id,
+                self.request_id,
+                AuditOutcome.rejected,
+                {"installment_id": installment_id, "reason": reason, **extra},
+            )
+            self.db.commit()
+
+        if terms is None:
+            reject("finance_terms_not_found")
+            raise FinanceTermsNotFoundError(terms_id)
+        if terms.status != TermsStatus.agreed:
+            reject("terms_not_agreed", status=terms.status.value)
+            raise TermsNotAgreedError()
+        row = next((r for r in terms.installments if r.installment_id == installment_id), None)
+        if row is None:
+            reject("installment_not_found")
+            raise InstallmentNotFoundError(installment_id, terms_id)
+        if row.status == InstallmentStatus.paid:
+            reject("installment_already_paid", paid_at=row.paid_at.isoformat())
+            raise InstallmentAlreadyPaidError()
+        if row.status == InstallmentStatus.cancelled:
+            reject("installment_cancelled")
+            raise InstallmentAlreadyCancelledError()
+
+        amount = row.installment_value + row.interest_value
+        result = payment_provider.charge(amount, reference)
+        if not result.approved:
+            reject(
+                result.reason or "declined_by_provider",
+                amount=str(amount),
+                reference=reference,
+                provider_reference=result.provider_reference,
+            )
+            raise PaymentDeclinedError()
+
+        row.status = InstallmentStatus.paid
+        row.paid_at = row.updated_at = datetime.now(UTC)
+        summary = ledger_summary(terms)
+        record_payment_event(
+            self.db,
+            terms_id,
+            self.request_id,
+            AuditOutcome.succeeded,
+            {
+                "installment_id": installment_id,
+                "amount": str(amount),
+                "reference": reference,
+                "provider_reference": result.provider_reference,
+                "paid_at": row.paid_at.isoformat(),
+                "balance_remaining": str(summary.balance_remaining),
+            },
+        )
+        self.db.commit()
+        return PaymentResponse(installment=installment_response(row), summary=summary)
 
     def list_finance_terms(self, filters: FinanceTermsFilters) -> FinanceTermsListResponse:
         query = select(FinanceTerms).options(selectinload(FinanceTerms.policies))

@@ -20,6 +20,7 @@ def payload(premium="200.00", tax_fee="50.00") -> dict:
     """Build a valid finance-terms request payload."""
     return {
         "due_date": (datetime.now(UTC).date() + timedelta(days=30)).isoformat(),
+        "payoff_date": (datetime.now(UTC).date() + timedelta(days=330)).isoformat(),
         "policies": [
             {
                 "insured_name": "Example Business",

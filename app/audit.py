@@ -93,3 +93,14 @@ def record_cancel_event(
 ) -> None:
     """Record a cancellation attempt while keeping its outcome explicit."""
     record_event(db, terms_id, AuditAction.cancel, outcome, request_id, details)
+
+
+def record_payment_event(
+    db: Session,
+    terms_id: uuid.UUID,
+    request_id: str,
+    outcome: AuditOutcome,
+    details: dict,
+) -> None:
+    """Record a payment attempt against an installment, approved or not."""
+    record_event(db, terms_id, AuditAction.payment, outcome, request_id, details)

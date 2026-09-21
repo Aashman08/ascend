@@ -9,10 +9,15 @@ from app.errors import (
     FinanceTermsNotFoundError,
     IdempotencyConflictError,
     InvalidStateError,
+    InstallmentAlreadyCancelledError,
+    InstallmentAlreadyPaidError,
+    InstallmentNotFoundError,
     NotFoundError,
+    PaymentDeclinedError,
     TermsAlreadyAgreedError,
     TermsCancelledError,
     TermsExpiredError,
+    TermsNotAgreedError,
 )
 
 
@@ -26,6 +31,11 @@ from app.errors import (
         (IdempotencyConflictError("order-1"), 409, "idempotency_conflict"),
         (TermsCancelledError(), 409, "invalid_state"),
         (TermsAlreadyAgreedError(), 409, "invalid_state"),
+        (TermsNotAgreedError(), 409, "invalid_state"),
+        (InstallmentAlreadyPaidError(), 409, "invalid_state"),
+        (InstallmentAlreadyCancelledError(), 409, "invalid_state"),
+        (InstallmentNotFoundError(3, uuid4()), 404, "not_found"),
+        (PaymentDeclinedError(), 402, "payment_declined"),
     ],
 )
 def test_application_error_contract(error, status_code, error_type):

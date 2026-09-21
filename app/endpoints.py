@@ -3,13 +3,16 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Query, Request, Response, status
+from fastapi import APIRouter, Body, Header, Query, Request, Response, status
 
 from app.client import create_finance_terms_client
 from app.schemas import (
     AuditListResponse,
     CancelRequest,
     FinanceTermsCreate,
+    LedgerResponse,
+    PaymentRequest,
+    PaymentResponse,
     FinanceTermsFilters,
     FinanceTermsListResponse,
     FinanceTermsResponse,
@@ -33,6 +36,11 @@ ERROR_409_IDEMPOTENCY = {
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 IDEMPOTENT_REPLAYED_HEADER = "Idempotent-Replayed"
 ERROR_500 = {"model": ErrorResponse, "description": "Unexpected server error."}
+ERROR_402 = {"model": ErrorResponse, "description": "The payment provider declined the charge."}
+ERROR_409_PAYMENT = {
+    "model": ErrorResponse,
+    "description": "Terms are not agreed, or the installment is already paid or cancelled.",
+}
 
 
 @router.post(
@@ -112,6 +120,33 @@ def cancel_finance_terms(
 ) -> FinanceTermsResponse:
     with create_finance_terms_client(request.state.request_id) as client:
         return client.cancel_finance_terms(terms_id, payload)
+
+
+@router.get(
+    "/finance-terms/{terms_id}/installments",
+    tags=["Repayment"],
+    response_model=LedgerResponse,
+    responses={404: ERROR_404, 500: ERROR_500},
+)
+def get_ledger(terms_id: uuid.UUID, request: Request) -> LedgerResponse:
+    with create_finance_terms_client(request.state.request_id) as client:
+        return client.get_ledger(terms_id)
+
+
+@router.post(
+    "/finance-terms/{terms_id}/installments/{installment_id}/pay",
+    tags=["Repayment"],
+    response_model=PaymentResponse,
+    responses={402: ERROR_402, 404: ERROR_404, 409: ERROR_409_PAYMENT, 500: ERROR_500},
+)
+def pay_installment(
+    terms_id: uuid.UUID,
+    installment_id: int,
+    request: Request,
+    payload: Annotated[PaymentRequest | None, Body()] = None,
+) -> PaymentResponse:
+    with create_finance_terms_client(request.state.request_id) as client:
+        return client.pay_installment(terms_id, installment_id, payload)
 
 
 @router.get(

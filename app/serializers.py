@@ -13,6 +13,7 @@ def finance_terms_response(terms: FinanceTerms) -> FinanceTermsResponse:
         id=terms.id,
         status=terms.status,
         due_date=terms.due_date,
+        payoff_date=terms.payoff_date,
         total_downpayment=terms.total_downpayment,
         total_amount=total,
         amount_financed=amount_financed(total, terms.total_downpayment),

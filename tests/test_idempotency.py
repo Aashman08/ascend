@@ -61,7 +61,11 @@ def test_equivalent_bodies_with_reordered_keys_share_a_fingerprint(client: TestC
     """Fingerprints come from the validated payload, so key order and whitespace do not matter."""
     key = str(uuid.uuid4())
     body = payload()
-    reordered = {"policies": [dict(reversed(list(body["policies"][0].items())))], "due_date": body["due_date"]}
+    reordered = {
+        "policies": [dict(reversed(list(body["policies"][0].items())))],
+        "payoff_date": body["payoff_date"],
+        "due_date": body["due_date"],
+    }
     reordered["policies"][0]["name"] = "  " + reordered["policies"][0]["name"] + "  "
     assert post(client, key, body).status_code == 201
     assert post(client, key, reordered).status_code == 201

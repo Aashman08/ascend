@@ -61,6 +61,8 @@ and evaluated in UTC. Replace the example due date if it is in the past.
 | `GET` | `/finance-terms/{id}` | Fetch one finance-terms record. |
 | `POST` | `/finance-terms/{id}/agree` | Agree to pending terms. |
 | `POST` | `/finance-terms/{id}/cancel` | Cancel pending terms with a reason. |
+| `GET` | `/finance-terms/{id}/installments` | Repayment ledger: schedule, payments, balance. |
+| `POST` | `/finance-terms/{id}/installments/{n}/pay` | Charge one installment through the (mock) provider. |
 | `GET` | `/audit` | List audit events or filter by finance-terms ID. |
 | `GET` | `/health` | Check whether the API is running. |
 
@@ -70,7 +72,8 @@ and evaluated in UTC. Replace the example due date if it is in the past.
 
 | Field | Type | Required | Description |
 |---|---|---:|---|
-| `due_date` | string | Yes | `YYYY-MM-DD`, today or later. |
+| `due_date` | string | Yes | `YYYY-MM-DD`, today or later. Last day the terms may be agreed. |
+| `payoff_date` | string | Yes | `YYYY-MM-DD`, after `due_date`. Last day of repayment. |
 | `policies` | array | Yes | 1–100 policy objects. |
 | `policies[].name` | string | Yes | Trimmed, 1–200 characters. |
 | `policies[].insured_name` | string | Yes | Trimmed, 1–200 characters. |
@@ -84,6 +87,7 @@ curl -sS -X POST 'http://localhost:8000/finance-terms' \
   -H 'Content-Type: application/json' \
   -d '{
     "due_date": "2026-12-12",
+    "payoff_date": "2027-10-01",
     "policies": [
       {"name": "Commercial Auto", "insured_name": "Example Business", "premium": "200.00", "tax_fee": "50.00"},
       {"name": "General Liability", "insured_name": "Example Business", "premium": "300.00", "tax_fee": "50.00"}
@@ -110,7 +114,7 @@ caller when authentication is added. Keys never expire in this version.
 curl -sS -X POST 'http://localhost:8000/finance-terms' \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: 6f1c2e4a-9c7b-4d3e-8a1f-2b5c7d9e0f13' \
-  -d '{"due_date": "2026-12-12", "policies": [{"name": "Commercial Auto", "insured_name": "Example Business", "premium": "200.00", "tax_fee": "50.00"}]}'
+  -d '{"due_date": "2026-12-12", "payoff_date": "2027-10-01", "policies": [{"name": "Commercial Auto", "insured_name": "Example Business", "premium": "200.00", "tax_fee": "50.00"}]}'
 ```
 
 ### 2. Get one finance-terms record
@@ -134,7 +138,8 @@ curl -sS -X POST 'http://localhost:8000/finance-terms/<id>/agree'
 ```
 
 Returns HTTP 200 with `status="agreed"` and the acceptance time in both
-`agreed_at` and `updated_at`. A missing ID returns HTTP 404. Expired or cancelled
+`agreed_at` and `updated_at`. Agreement also generates the repayment ledger
+(see section 3c). A missing ID returns HTTP 404. Expired or cancelled
 terms return HTTP 409. Repeating an agreement returns HTTP 200 with the original
 timestamp.
 
@@ -162,6 +167,48 @@ retry is ignored. Agreed terms cannot be cancelled and return HTTP 409; cancelli
 already-agreed terms needs separate business rules. Expired pending terms may still
 be cancelled, since expiry only blocks agreement. Cancelled terms cannot be agreed
 and return HTTP 409. A missing ID returns HTTP 404.
+
+### 3c. Repayment ledger and payments
+
+Agreeing terms creates one ledger row per scheduled payment: row `0` is the down
+payment, due on the agreement date; rows `1..N` are equal installments every 30
+days from agreement until `payoff_date`, never fewer than one and never due after
+`payoff_date`. Principal is split to the cent with the rounding remainder on the
+final installment. Each installment carries flat interest of 1% of its principal.
+Rates and the interval are constants in `app/pricing.py`.
+
+```bash
+curl -sS 'http://localhost:8000/finance-terms/<id>/installments'
+```
+
+Returns the terms status, the installments with `installment_type`,
+`installment_value` (principal), `interest_value`, `total_due`, `due_date`,
+`status`, and `paid_at`, plus a summary: `total_due`, `total_paid`,
+`balance_remaining`, `next_due`, and `repayment_status` (`pending`,
+`in_progress`, `paid_off`, or `cancelled`). Pending terms return an empty schedule.
+An installment whose due date has passed unpaid reports `status="overdue"`;
+this is computed from today's date, not stored.
+
+```bash
+curl -sS -X POST 'http://localhost:8000/finance-terms/<id>/installments/0/pay' \
+  -H 'Content-Type: application/json' \
+  -d '{"reference": "card-1234"}'
+```
+
+Charges one installment through the payment provider and, on approval, marks it
+`paid` with `paid_at`. The body is optional; `reference` is the caller's own
+identifier for the charge. Returns HTTP 200 with the installment and the updated
+summary. Terms that are not agreed return HTTP 409. An installment that is
+already paid or was cancelled returns HTTP 409. An unknown installment number
+returns HTTP 404. A declined charge returns HTTP 402 `payment_declined` and
+leaves the installment pending. Late payments succeed. Concurrent charges for
+one installment serialize on the terms row, so the customer is charged once.
+
+The provider is a mock in `app/payment_provider.py`: every charge is approved
+unless `reference` starts with `decline`, which lets the failure path be
+exercised deterministically. Cancelling pending terms cancels their unpaid
+installments. Partial payments, overpayment, refunds, automatic collection, and
+calendar-month scheduling are not implemented.
 
 ### 4. List, filter, and sort
 
@@ -231,6 +278,8 @@ inspection of rejected attempts; an ID with no history returns an empty list.
 | `cancel` | `succeeded` | Previous/new status, cancellation timestamp, and reason |
 | `cancel` | `unchanged` | Retry of an already cancelled agreement |
 | `cancel` | `rejected` | Already agreed terms or nonexistent terms ID |
+| `payment` | `succeeded` | Installment number, amount, caller and provider references, remaining balance |
+| `payment` | `rejected` | Terms not agreed, unknown/paid/cancelled installment, provider decline, or missing terms |
 
 Successful mutations and their audit events commit together. An audit write failure
 rolls back the mutation. Business rejections commit their event before returning
@@ -272,7 +321,8 @@ This project uses SQLAlchemy models backed by PostgreSQL; it does not use Prisma
 |---|---|---|
 | `id` | `UUID` | Primary key. |
 | `status` | `terms_status` enum | `pending`, `agreed`, or `cancelled`. |
-| `due_date` | `DATE` | Terms expiry date. |
+| `due_date` | `DATE` | Last day the terms may be agreed. |
+| `payoff_date` | `DATE` | Last day of repayment; null for terms created before the ledger existed. |
 | `total_downpayment` | `NUMERIC(12,2)` | Total amount due upfront. |
 | `agreed_at` | `TIMESTAMPTZ` | Nullable until terms are agreed. |
 | `cancelled_at` | `TIMESTAMPTZ` | Nullable until terms are cancelled. |
@@ -305,6 +355,22 @@ This project uses SQLAlchemy models backed by PostgreSQL; it does not use Prisma
 | `request_id` | `VARCHAR(200)` | Server-generated request ID. |
 | `details` | `JSONB` | Action-specific audit payload. |
 
+### `installments`
+
+| Field | PostgreSQL type | Notes |
+|---|---|---|
+| `id` | `UUID` | Primary key. |
+| `finance_terms_id` | `UUID` | Foreign key to `finance_terms.id`; cascades on delete. |
+| `installment_id` | `BIGINT` | Position within the agreement: `0` down payment, `1..N` installments. |
+| `installment_type` | `installment_type` enum | `downpayment` or `installment`. |
+| `installment_value` | `NUMERIC(12,2)` | Principal portion due. |
+| `interest_value` | `NUMERIC(12,2)` | Interest due on this installment. |
+| `due_date` | `DATE` | Scheduled payment date. |
+| `status` | `installment_status` enum | `pending`, `paid`, `overdue`, or `cancelled`; `overdue` is reported, not stored. |
+| `paid_at` | `TIMESTAMPTZ` | Nullable until paid. |
+| `created_at` | `TIMESTAMPTZ` | Database-generated creation time. |
+| `updated_at` | `TIMESTAMPTZ` | Set by the application when status changes. |
+
 ### `idempotency_keys`
 
 | Field | PostgreSQL type | Notes |
@@ -314,8 +380,9 @@ This project uses SQLAlchemy models backed by PostgreSQL; it does not use Prisma
 | `finance_terms_id` | `UUID` | Foreign key to `finance_terms.id`; cascades on delete. |
 | `created_at` | `TIMESTAMPTZ` | Database-generated creation time. |
 
-`finance_terms` has many `policies` and at most one `idempotency_keys` row.
-Deleting a finance-terms record cascades to its policies and its idempotency key. Audit events are independent and remain available after a parent
+`finance_terms` has many `policies`, many `installments` once agreed, and at most
+one `idempotency_keys` row. Deleting a finance-terms record cascades to its
+policies, installments, and idempotency key. Audit events are independent and remain available after a parent
 record is deleted.
 
 ## Data and code organization
@@ -323,8 +390,10 @@ record is deleted.
 | Module | Responsibility |
 |---|---|
 | `app/models.py` | SQLAlchemy models for finance terms, policies, and audit events, plus the `TermsStatus`, `AuditAction`, and `AuditOutcome` enums. |
-| `app/pricing.py` | `Decimal` calculations at a fixed 20% rate, `ROUND_HALF_UP` rounding, and amount-limit rules. |
+| `app/pricing.py` | `Decimal` calculations at a fixed 20% rate, `ROUND_HALF_UP` rounding, amount-limit rules, and the repayment schedule. |
 | `app/schemas.py` | Request body/query validation and API response contracts. |
+| `app/installments.py` | Builds ledger rows from the pricing schedule at agreement and renders the ledger response, including computed `overdue`. |
+| `app/payment_provider.py` | Mock payment provider; approves every charge unless the reference starts with `decline`. |
 | `app/client.py` | Finance-terms operations, row locking, transactions, audit recording, and the status/timestamp consistency check run before every state-changing commit. |
 | `app/serializers.py` | Converts database models into typed API response models. |
 | `app/endpoints.py` | HTTP route definitions for finance terms, audit history, and health checks. |
@@ -350,7 +419,8 @@ checkout labels; a product catalog is not modeled.
 | HTTP status | Error type | Meaning | Response shape |
 |---:|---|---|---|
 | `404` | `not_found` | Requested finance terms do not exist. | Application error |
-| `409` | `invalid_state` | Terms have expired or been cancelled and cannot be agreed, or are agreed and cannot be cancelled. | Application error |
+| `402` | `payment_declined` | The payment provider declined the charge; the installment stays pending. | Application error |
+| `409` | `invalid_state` | Terms have expired or been cancelled and cannot be agreed, are agreed and cannot be cancelled, are not agreed and cannot be paid, or the installment is already paid or cancelled. | Application error |
 | `409` | `idempotency_conflict` | `Idempotency-Key` was already used with a different request body. | Application error |
 | `422` | `validation_error` | Request body, query parameter, or path parameter is invalid. | FastAPI standard response |
 | `405` | — | HTTP method is not supported for the route. | FastAPI standard response |
@@ -411,6 +481,8 @@ audit recording, and transaction rollback. Migration tests also verify schema/mo
 agreement, data preservation on restart, upgrades to populated databases, rollback
 on failure, and concurrent startup.
 
+Ledger tests cover schedule generation, the rounding remainder, mock approvals and
+declines, late payments, cancellation, and concurrent charges for one installment.
 Idempotency tests cover replays, key reuse with a different body, concurrent
 first attempts, and unkeyed requests. Authentication and tenancy are outside
 this exercise. Audit history and its tests extend the original take-home scope.
@@ -429,10 +501,10 @@ implementation order:
    cancelled original, preserving its policies and history. Cancellation of already
    agreed terms needs separate business rules and possibly a refund flow.
 
-3. **Payment tracking:** Integrate a payment provider to track downpayment
-   collection, failed payments, and refunds. Payment status would be tracked
-   separately from agreement status because accepting terms does not mean payment
-   has been collected.
+3. **Real payment collection:** Replace the mock provider with an integration,
+   add partial payments and overpayment handling, refunds after mid-term
+   cancellation, optional automatic collection on due dates, and calendar-month
+   scheduling with proration of a short final period.
 
 4. **Event notifications:** Notify integrating applications when terms are
    accepted, cancelled, or approaching expiry so they need not repeatedly fetch
