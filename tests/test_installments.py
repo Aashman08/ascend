@@ -89,10 +89,11 @@ def test_short_repayment_window_still_produces_one_installment_clamped_to_payoff
     assert rows[1]["due_date"] <= terms["payoff_date"]
 
 
-def test_paying_an_installment_marks_it_paid_and_advances_next_due(client: TestClient):
+def test_paying_an_installment_updates_payment_state_and_balance(client: TestClient):
+    """A successful payment marks the installment paid and advances the balance."""
     terms = create(client)
     agree(client, terms["id"])
-    response = pay(client, terms["id"], 0, reference="card-1234")
+    response = pay(client, terms["id"], 0)
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["installment"]["status"] == "paid"
@@ -102,16 +103,34 @@ def test_paying_an_installment_marks_it_paid_and_advances_next_due(client: TestC
     assert body["summary"]["next_due"]["installment_id"] == 1
     assert ledger(client, terms["id"])["installments"][0] == body["installment"]
 
+
+def test_paying_an_already_paid_installment_is_rejected(client: TestClient):
+    """A second payment attempt is rejected and recorded as a rejection."""
+    terms = create(client)
+    agree(client, terms["id"])
+    assert pay(client, terms["id"], 0).status_code == 200
+
     again = pay(client, terms["id"], 0)
     assert again.status_code == 409
     assert again.json()["error"]["type"] == "invalid_state"
     events = [e for e in history(client, terms["id"]) if e["action"] == "payment"]
-    assert [e["outcome"] for e in events] == ["succeeded", "rejected"]
-    assert events[0]["details"]["amount"] == "200.00"
-    assert events[0]["details"]["reference"] == "card-1234"
-    assert events[0]["details"]["provider_reference"].startswith("mock_")
-    assert events[0]["request_id"] == response.headers["X-Request-ID"]
-    assert events[1]["details"]["reason"] == "installment_already_paid"
+    assert events[-1]["outcome"] == "rejected"
+    assert events[-1]["details"]["reason"] == "installment_already_paid"
+
+
+def test_successful_payment_records_charge_metadata(client: TestClient):
+    """A successful payment audits the amount, caller reference, and provider reference."""
+    terms = create(client)
+    agree(client, terms["id"])
+    response = pay(client, terms["id"], 0, reference="card-1234")
+    assert response.status_code == 200, response.text
+
+    event = [e for e in history(client, terms["id"]) if e["action"] == "payment"][-1]
+    assert event["outcome"] == "succeeded"
+    assert event["details"]["amount"] == "200.00"
+    assert event["details"]["reference"] == "card-1234"
+    assert event["details"]["provider_reference"].startswith("mock_")
+    assert event["request_id"] == response.headers["X-Request-ID"]
 
 
 def test_declined_charge_returns_402_and_leaves_installment_pending(client: TestClient):
