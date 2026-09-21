@@ -1,6 +1,8 @@
 """Request validation and public response contracts. Money serializes as strings."""
 
 import enum
+import hashlib
+import json
 import re
 import uuid
 from datetime import UTC, date, datetime
@@ -84,6 +86,19 @@ class FinanceTermsCreate(BaseModel):
         pricing.validate_total_downpayment((p.premium, p.tax_fee) for p in self.policies)
         return self
 
+    def fingerprint(self) -> str:
+        """SHA-256 of the validated payload in canonical JSON, for Idempotency-Key reuse checks."""
+        canonical = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+class CancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    reason: str = Field(
+        min_length=1, max_length=500, examples=["Customer chose another carrier"]
+    )
+
 
 class SortField(str, enum.Enum):
     downpayment = "downpayment"
@@ -159,6 +174,8 @@ class FinanceTermsResponse(BaseModel):
     total_amount: Decimal
     amount_financed: Decimal
     agreed_at: datetime | None
+    cancelled_at: datetime | None
+    cancel_reason: str | None
     created_at: datetime
     updated_at: datetime
     policies: list[PolicyResponse]

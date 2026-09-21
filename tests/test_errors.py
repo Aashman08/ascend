@@ -7,8 +7,11 @@ import pytest
 from app.errors import (
     APIError,
     FinanceTermsNotFoundError,
+    IdempotencyConflictError,
     InvalidStateError,
     NotFoundError,
+    TermsAlreadyAgreedError,
+    TermsCancelledError,
     TermsExpiredError,
 )
 
@@ -20,6 +23,9 @@ from app.errors import (
         (NotFoundError(), 404, "not_found"),
         (InvalidStateError(), 409, "invalid_state"),
         (TermsExpiredError(), 409, "invalid_state"),
+        (IdempotencyConflictError("order-1"), 409, "idempotency_conflict"),
+        (TermsCancelledError(), 409, "invalid_state"),
+        (TermsAlreadyAgreedError(), 409, "invalid_state"),
     ],
 )
 def test_application_error_contract(error, status_code, error_type):

@@ -29,17 +29,25 @@ class Base(DeclarativeBase):
 class TermsStatus(str, enum.Enum):
     pending = "pending"
     agreed = "agreed"
+    cancelled = "cancelled"
+
+
+class AuditAction(str, enum.Enum):
+    create = "create"
+    agree = "agree"
+    cancel = "cancel"
+
+
+class AuditOutcome(str, enum.Enum):
+    succeeded = "succeeded"
+    unchanged = "unchanged"
+    rejected = "rejected"
 
 
 class FinanceTerms(Base):
     __tablename__ = "finance_terms"
     __table_args__ = (
         CheckConstraint("total_downpayment >= 0", name="terms_downpayment_nonnegative"),
-        CheckConstraint(
-            "(status = 'pending' AND agreed_at IS NULL) OR "
-            "(status = 'agreed' AND agreed_at IS NOT NULL)",
-            name="terms_agreement_consistent",
-        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -52,6 +60,8 @@ class FinanceTerms(Base):
     due_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     total_downpayment: Mapped[Decimal] = mapped_column(Money, nullable=False, index=True)
     agreed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_reason: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -94,17 +104,12 @@ class AuditEvent(Base):
     """Append-only business history; also records attempts against nonexistent IDs."""
 
     __tablename__ = "audit_events"
-    __table_args__ = (
-        Index("ix_audit_events_terms_id", "finance_terms_id", "id"),
-        CheckConstraint("action IN ('create', 'agree')", name="audit_action_valid"),
-        CheckConstraint(
-            "outcome IN ('succeeded', 'unchanged', 'rejected')", name="audit_outcome_valid"
-        ),
-    )
+    __table_args__ = (Index("ix_audit_events_terms_id", "finance_terms_id", "id"),)
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     # No foreign key: rejected attempts can target missing terms; history survives deletion.
     finance_terms_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    # Allowed values are the AuditAction/AuditOutcome enums, enforced in app/audit.py.
     action: Mapped[str] = mapped_column(String(20), nullable=False)
     outcome: Mapped[str] = mapped_column(String(20), nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(
@@ -112,3 +117,18 @@ class AuditEvent(Base):
     )
     request_id: Mapped[str | None] = mapped_column(String(200))
     details: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+
+class IdempotencyKey(Base):
+    """Maps a client-supplied Idempotency-Key to the finance terms it created."""
+
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(200), primary_key=True)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    finance_terms_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("finance_terms.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

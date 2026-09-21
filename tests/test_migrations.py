@@ -12,6 +12,8 @@ from sqlalchemy.exc import ProgrammingError
 from app.database import MIGRATIONS_DIR, migrate_database
 from app.models import Base
 
+COMMITTED = [script.name for script in sorted(MIGRATIONS_DIR.glob("[0-9]*_*.sql"))]
+
 
 def test_fresh_database_matches_models_and_restart_preserves_data(database_engine):
     migrate_database(database_engine)
@@ -37,9 +39,9 @@ def test_fresh_database_matches_models_and_restart_preserves_data(database_engin
         )
     migrate_database(database_engine)
     with database_engine.connect() as connection:
-        assert list(connection.scalars(text("SELECT version FROM schema_migrations"))) == [
-            "0001_initial_schema.sql"
-        ]
+        assert list(connection.scalars(text(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ))) == COMMITTED
         assert connection.scalar(text("SELECT id FROM finance_terms")) == terms_id
 
 
@@ -52,13 +54,13 @@ def test_pending_migration_updates_populated_database(database_engine, tmp_path)
         ))
     scripts = tmp_path / "migrations"
     shutil.copytree(MIGRATIONS_DIR, scripts)
-    (scripts / "0002_add_source.sql").write_text(
+    (scripts / "9999_add_source.sql").write_text(
         "ALTER TABLE audit_events ADD COLUMN source TEXT NOT NULL DEFAULT 'api';"
     )
     migrate_database(database_engine, scripts)
     with database_engine.connect() as connection:
         assert connection.scalar(text("SELECT max(version) FROM schema_migrations")) == (
-            "0002_add_source.sql"
+            "9999_add_source.sql"
         )
         assert connection.scalar(text("SELECT source FROM audit_events")) == "api"
         assert connection.scalar(text("SELECT count(*) FROM audit_events")) == 1
@@ -68,7 +70,7 @@ def test_failed_migration_rolls_back_schema_and_version_and_can_retry(database_e
     migrate_database(database_engine)
     scripts = tmp_path / "migrations"
     shutil.copytree(MIGRATIONS_DIR, scripts)
-    migration = scripts / "0002_add_source.sql"
+    migration = scripts / "9999_add_source.sql"
     migration.write_text(
         "ALTER TABLE audit_events ADD COLUMN source TEXT;\n"
         "INSERT INTO nonexistent_table VALUES (1);"
@@ -77,7 +79,7 @@ def test_failed_migration_rolls_back_schema_and_version_and_can_retry(database_e
         migrate_database(database_engine, scripts)
     assert "source" not in {c["name"] for c in inspect(database_engine).get_columns("audit_events")}
     with database_engine.connect() as connection:
-        assert connection.scalar(text("SELECT count(*) FROM schema_migrations")) == 1
+        assert connection.scalar(text("SELECT count(*) FROM schema_migrations")) == len(COMMITTED)
     migration.write_text("ALTER TABLE audit_events ADD COLUMN source TEXT;")
     migrate_database(database_engine, scripts)
     assert "source" in {c["name"] for c in inspect(database_engine).get_columns("audit_events")}
@@ -95,12 +97,12 @@ def test_concurrent_startups_apply_migrations_once(database_engine):
         for future in futures:
             future.result(timeout=20)
     with database_engine.connect() as connection:
-        assert connection.scalar(text("SELECT count(*) FROM schema_migrations")) == 1
+        assert connection.scalar(text("SELECT count(*) FROM schema_migrations")) == len(COMMITTED)
 
 
 def test_changed_migration_history_is_rejected(database_engine, tmp_path):
     migrate_database(database_engine)
-    (tmp_path / "0002_out_of_order.sql").write_text("DROP TABLE audit_events;")
+    (tmp_path / "9999_out_of_order.sql").write_text("DROP TABLE audit_events;")
     with pytest.raises(RuntimeError, match="Migration history"):
         migrate_database(database_engine, tmp_path)
     assert inspect(database_engine).has_table("audit_events")
